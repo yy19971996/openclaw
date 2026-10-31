@@ -56,7 +56,18 @@ export async function readUpdateStateDatabaseSizesInProcess(
   return result;
 }
 
-/** Measure SQLite families in a bounded child so metadata cannot block updater cancellation. */
+/** One child run keeps its inventory payload well under the 1 MiB stdout cap. */
+const STATE_SIZES_PATHS_PER_CHUNK = 1_000;
+
+function chunkStateSizePaths(files: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  for (let index = 0; index < files.length; index += STATE_SIZES_PATHS_PER_CHUNK) {
+    chunks.push(files.slice(index, index + STATE_SIZES_PATHS_PER_CHUNK));
+  }
+  return chunks;
+}
+
+/** Measure SQLite families in bounded children so metadata cannot block updater cancellation. */
 export async function readUpdateStateDatabaseSizes(
   files: readonly string[],
   options: {
@@ -67,68 +78,84 @@ export async function readUpdateStateDatabaseSizes(
     signal?: AbortSignal;
   },
 ): Promise<Array<{ path: string; sizeBytes: bigint | undefined }>> {
-  // Until sizes are known, use the existing per-source startup/shutdown budget.
-  const budget = resolveAggregateSqliteInspectionTimeoutMs(
+  if (files.length === 0) {
+    return [];
+  }
+  // Large state directories carry hundreds of thousands of paths; one child cannot
+  // return that inventory without tripping the stdout cap, so measure in bounded
+  // chunks and concatenate. Each chunk keeps the existing per-source budget.
+  const chunks = chunkStateSizePaths(files);
+  const totalBudget = resolveAggregateSqliteInspectionTimeoutMs(
     "state schema inventory",
     files.map((file) => ({ path: file, sizeBytes: undefined })),
   );
+  const perChunkBudget = Math.max(1, Math.floor(totalBudget / chunks.length));
   const inspection = createUpdateStateInspectionDiagnostics({
     operation: "State schema inventory",
     phase: "metadata inventory",
     paths: files,
   });
-  let result;
-  let dispose: (() => void) | undefined;
-  let cleanupUncertain = false;
-  try {
+  const measured: Array<{ path: string; sizeBytes: bigint | undefined }> = [];
+  for (const chunk of chunks) {
     options.signal?.throwIfAborted();
-    // Embedded source remains available after activation replaces the updater package.
-    const script = prepareRuntimeProcessScriptInvocation("updateStateSizes", options.nodeRunner, {
-      parentDirectory: options.stagingRoot,
-    });
-    dispose = () => script.dispose();
-    result = await withUpdateStateInspectionWork(
-      () =>
-        runUtf8CommandWithTimeout(script.argv, {
-          cwd: os.tmpdir(),
-          input: JSON.stringify({ files }),
-          baseEnv: options.sourceEnv,
-          env: { XDG_CACHE_HOME: options.stagingRoot },
-          signal: options.signal,
-          timeoutMs: resolveTimerTimeoutMs(Math.max(options.timeoutMs ?? 0, budget), budget),
-          killGraceMs: 500,
-          killProcessTree: true,
-          maxOutputBytes: { stdout: 1024 * 1024, stderr: 20_000 },
-          outputCapture: { stdout: "head", stderr: "discard" },
-          terminateOnOutputLimit: { stdout: true },
-          onOutputChunk: inspection.onOutputChunk,
-        }),
-      options.signal,
-    );
-  } catch (error) {
-    cleanupUncertain = hasCommandProcessCleanupError(error);
-    if (!cleanupUncertain) {
-      options.signal?.throwIfAborted();
+    let result;
+    let dispose: (() => void) | undefined;
+    let cleanupUncertain = false;
+    try {
+      // Embedded source remains available after activation replaces the updater package.
+      const script = prepareRuntimeProcessScriptInvocation("updateStateSizes", options.nodeRunner, {
+        parentDirectory: options.stagingRoot,
+      });
+      dispose = () => script.dispose();
+      result = await withUpdateStateInspectionWork(
+        () =>
+          runUtf8CommandWithTimeout(script.argv, {
+            cwd: os.tmpdir(),
+            input: JSON.stringify({ files: chunk }),
+            baseEnv: options.sourceEnv,
+            env: { XDG_CACHE_HOME: options.stagingRoot },
+            signal: options.signal,
+            timeoutMs: resolveTimerTimeoutMs(
+              Math.max(options.timeoutMs ?? 0, perChunkBudget),
+              perChunkBudget,
+            ),
+            killGraceMs: 500,
+            killProcessTree: true,
+            maxOutputBytes: { stdout: 1024 * 1024, stderr: 20_000 },
+            outputCapture: { stdout: "head", stderr: "discard" },
+            terminateOnOutputLimit: { stdout: true },
+            onOutputChunk: inspection.onOutputChunk,
+          }),
+        options.signal,
+      );
+    } catch (error) {
+      cleanupUncertain = hasCommandProcessCleanupError(error);
+      if (!cleanupUncertain) {
+        options.signal?.throwIfAborted();
+      }
+      throw inspection.failure(error);
+    } finally {
+      if (!cleanupUncertain) {
+        dispose?.();
+      }
     }
-    throw inspection.failure(error);
-  } finally {
-    if (!cleanupUncertain) {
-      dispose?.();
+    options.signal?.throwIfAborted();
+    if (result.code !== 0 || result.termination !== "exit" || result.outputLimitExceeded) {
+      throw inspection.failure(
+        inspection.stderr(),
+        result.outputLimitExceeded ? "output-limit" : result.termination,
+      );
+    }
+    try {
+      measured.push(
+        ...inventorySchema.parse(JSON.parse(result.stdout)).map((entry) => ({
+          path: entry.path,
+          sizeBytes: entry.sizeBytes === undefined ? undefined : BigInt(entry.sizeBytes),
+        })),
+      );
+    } catch (error) {
+      throw inspection.failure(error);
     }
   }
-  options.signal?.throwIfAborted();
-  if (result.code !== 0 || result.termination !== "exit" || result.outputLimitExceeded) {
-    throw inspection.failure(
-      inspection.stderr(),
-      result.outputLimitExceeded ? "output-limit" : result.termination,
-    );
-  }
-  try {
-    return inventorySchema.parse(JSON.parse(result.stdout)).map((entry) => ({
-      path: entry.path,
-      sizeBytes: entry.sizeBytes === undefined ? undefined : BigInt(entry.sizeBytes),
-    }));
-  } catch (error) {
-    throw inspection.failure(error);
-  }
+  return measured;
 }
